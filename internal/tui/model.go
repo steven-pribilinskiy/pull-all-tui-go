@@ -65,6 +65,7 @@ type Model struct {
 	elapsed   time.Duration
 
 	userNavigated bool // user moved cursor manually
+	ctrlC         bool // quit was triggered by Ctrl-C
 }
 
 type repoItem struct {
@@ -223,6 +224,7 @@ func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return model, tea.Quit
 
 	case "ctrl+c":
+		model.ctrlC = true
 		model.cfg.Cancel()
 		return model, tea.Quit
 
@@ -756,10 +758,13 @@ func padRight(str string, width int) string {
 }
 
 // ExitCode returns the appropriate exit code based on final run state.
-// 0 = all succeeded, 1 = any failed, 2 = quit mid-run.
+// 0 = all succeeded, 1 = any failed, 2 = quit mid-run, 130 = Ctrl-C.
 func (model *Model) ExitCode() int {
+	if model.ctrlC {
+		return 130
+	}
 	if !model.allDone {
-		return 2 // quit mid-run
+		return 2 // quit mid-run via q/Esc
 	}
 	for name, item := range model.results {
 		if name == resultItemName {

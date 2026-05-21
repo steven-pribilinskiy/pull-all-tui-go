@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/sys/unix"
@@ -114,6 +116,15 @@ func run() int {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Propagate SIGTERM/SIGINT to the context so child processes are cancelled.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		sig := <-sigCh
+		_ = sig
+		cancel()
+	}()
 	defer cancel()
 
 	// Use an atomic pointer so we can set the program reference after creation,
