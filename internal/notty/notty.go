@@ -236,46 +236,25 @@ func runPull(ctx context.Context, timeout int, repo discovery.Repo) *repoResult 
 	cmd.Stdin = devNull
 	defer devNull.Close()
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	// Capture to a tempfile, not a pipe. Reason: SSH ControlMaster daemons
+	// spawned by `git pull` inherit any pipe writers and outlive the SIGKILL
+	// exec.CommandContext sends on context cancel — bufio.Scanner then never
+	// sees EOF and streamWg.Wait hangs until ControlPersist expires (minutes).
+	// Tempfile output sidesteps the inheritance hazard entirely. Mirrors the
+	// bash reference's strategy.
+	logFile, err := os.CreateTemp("", "pull-all-tui-*.log")
 	if err != nil {
 		return &repoResult{status: parser.StatusFailed, lines: []string{err.Error()}}
 	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return &repoResult{status: parser.StatusFailed, lines: []string{err.Error()}}
-	}
+	defer os.Remove(logFile.Name())
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
+		logFile.Close()
 		return &repoResult{status: parser.StatusFailed, lines: []string{err.Error()}}
 	}
 
-	var lines []string
-	var linesMu sync.Mutex
-	var streamWg sync.WaitGroup
-	streamWg.Add(2)
-
-	addLine := func(line string) {
-		linesMu.Lock()
-		lines = append(lines, line)
-		linesMu.Unlock()
-	}
-
-	go func() {
-		defer streamWg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			addLine(scanner.Text())
-		}
-	}()
-	go func() {
-		defer streamWg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			addLine(scanner.Text())
-		}
-	}()
-
-	streamWg.Wait()
 	exitCode := 0
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -284,11 +263,16 @@ func runPull(ctx context.Context, timeout int, repo discovery.Repo) *repoResult 
 			exitCode = 1
 		}
 	}
+	logFile.Close()
 
-	linesMu.Lock()
-	capturedLines := make([]string, len(lines))
-	copy(capturedLines, lines)
-	linesMu.Unlock()
+	var capturedLines []string
+	if f, ferr := os.Open(logFile.Name()); ferr == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			capturedLines = append(capturedLines, scanner.Text())
+		}
+		f.Close()
+	}
 
 	status := parser.ClassifyOutput(exitCode, capturedLines)
 	result := &repoResult{status: status, lines: capturedLines}

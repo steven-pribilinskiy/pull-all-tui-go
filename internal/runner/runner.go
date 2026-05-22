@@ -219,25 +219,29 @@ func (runner *Runner) runPull(ctx context.Context, repo discovery.Repo) {
 	defer cancel()
 
 	cmd := exec.CommandContext(pullCtx, "git", "-C", repo.Path, "pull", "--ff-only")
-	// Redirect stdin from /dev/null to prevent SSH ControlMaster hang.
 	cmd.Stdin, _ = os.Open(os.DevNull)
 
-	stdoutPipe, err := cmd.StdoutPipe()
+	// Mirror the bash reference: capture stdout+stderr to a tempfile, NOT a
+	// pipe. Reason: `git pull` over SSH spawns a ControlMaster daemon that
+	// inherits the pipe writers and outlives the SIGKILL exec.CommandContext
+	// sends on context cancel. With pipes, bufio.Scanner never sees EOF and
+	// the whole worker hangs until ControlPersist expires (minutes). With a
+	// tempfile, no daemon-held writer keeps anything open. Live streaming
+	// during the pull is lost; for a 2–5 s pull batch-emitting at end is the
+	// same UX the bash reference provides.
+	logFile, err := os.CreateTemp("", "pull-all-tui-*.log")
 	if err != nil {
 		result.AppendLine(fmt.Sprintf("error: %v", err))
 		result.SetStatus(parser.StatusFailed)
 		runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusFailed})
 		return
 	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		result.AppendLine(fmt.Sprintf("error: %v", err))
-		result.SetStatus(parser.StatusFailed)
-		runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusFailed})
-		return
-	}
+	defer os.Remove(logFile.Name())
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
+		logFile.Close()
 		result.AppendLine(fmt.Sprintf("error: %v", err))
 		result.SetStatus(parser.StatusFailed)
 		runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusFailed})
@@ -249,38 +253,6 @@ func (runner *Runner) runPull(ctx context.Context, repo discovery.Repo) {
 	result.mu.Unlock()
 	runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusRunning, PID: cmd.Process.Pid})
 
-	// Collect all lines for classification.
-	var allLines []string
-	var linesMu sync.Mutex
-
-	addLine := func(line string) {
-		result.AppendLine(line)
-		runner.cfg.Send(LineMsg{RepoName: repo.Name, Line: line})
-		linesMu.Lock()
-		allLines = append(allLines, line)
-		linesMu.Unlock()
-	}
-
-	var streamWg sync.WaitGroup
-	streamWg.Add(2)
-
-	go func() {
-		defer streamWg.Done()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			addLine(scanner.Text())
-		}
-	}()
-
-	go func() {
-		defer streamWg.Done()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			addLine(scanner.Text())
-		}
-	}()
-
-	streamWg.Wait()
 	exitCode := 0
 	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -289,11 +261,21 @@ func (runner *Runner) runPull(ctx context.Context, repo discovery.Repo) {
 			exitCode = 1
 		}
 	}
+	logFile.Close()
 
-	linesMu.Lock()
-	capturedLines := make([]string, len(allLines))
-	copy(capturedLines, allLines)
-	linesMu.Unlock()
+	// Read the captured log and replay it line by line so the UI sees each
+	// step (matches the original streaming behavior, just deferred to end).
+	capturedLines := []string{}
+	if f, ferr := os.Open(logFile.Name()); ferr == nil {
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
+			capturedLines = append(capturedLines, line)
+			result.AppendLine(line)
+			runner.cfg.Send(LineMsg{RepoName: repo.Name, Line: line})
+		}
+		f.Close()
+	}
 
 	status := parser.ClassifyOutput(exitCode, capturedLines)
 
@@ -304,7 +286,8 @@ func (runner *Runner) runPull(ctx context.Context, repo discovery.Repo) {
 		diffOut, diffErr := diffCmd.Output()
 		if diffErr == nil && len(diffOut) > 0 {
 			for _, line := range strings.Split(strings.TrimRight(string(diffOut), "\n"), "\n") {
-				addLine(line)
+				result.AppendLine(line)
+				runner.cfg.Send(LineMsg{RepoName: repo.Name, Line: line})
 			}
 		}
 	}
