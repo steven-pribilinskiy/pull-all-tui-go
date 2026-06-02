@@ -1,6 +1,12 @@
 // pull-all-tui: interactive multi-repo git-pull dashboard.
 package main
 
+// forceterm's init() suppresses bubbletea's blocking OSC 11 background query
+// (the blank-screen bug). It's imported via the "forceterm.local" module path
+// (replaced to ./forceterm) precisely because that path sorts before
+// "github.com/charmbracelet/...", so Go runs its init() before bubbletea's.
+import _ "forceterm.local"
+
 import (
 	"context"
 	"flag"
@@ -154,7 +160,6 @@ func run() int {
 
 	prog := tea.NewProgram(tuiModel,
 		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
 	)
 	progPtr.Store(prog)
 
