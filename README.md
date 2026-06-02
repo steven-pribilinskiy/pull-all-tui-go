@@ -45,6 +45,8 @@ make build
 | `k` / `↑` | Previous repo |
 | `g` | Jump to top |
 | `G` | Jump to bottom (Result item) |
+| `Space` | Toggle the Result summary in the preview without moving selection (any navigation clears it) |
+| `[` / `]` | Narrow / widen the left pane |
 | `r` / `Enter` | Retry selected failed repo |
 | `R` | Retry all failed repos |
 | `c` | Clear selected repo's log buffer |
@@ -53,9 +55,16 @@ make build
 | `PgDn` / `Ctrl-D` | Scroll preview down |
 | `End` | Resume auto-scroll in preview |
 | `/` | Filter list by substring |
-| `Esc` | Clear filter / quit |
+| `Esc` | Clear filter |
 | `q` | Quit |
 | `Ctrl-C` | Quit (exit 130) |
+
+### Mouse
+
+Click a repo row to select it, scroll the wheel over the left pane to move the
+selection or over the right pane to scroll the preview, and drag the divider
+between the panes to resize. The app captures the mouse while running, so native
+terminal text-selection is suspended until you quit.
 
 ## Exit codes
 

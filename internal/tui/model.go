@@ -42,9 +42,9 @@ type Config struct {
 // Model is the bubbletea model.
 type Model struct {
 	cfg       Config
-	repos     []discovery.Repo         // alphabetical
-	results   map[string]*repoItem     // keyed by repo name
-	listOrder []string                 // repo names in list order (repos + result)
+	repos     []discovery.Repo     // alphabetical
+	results   map[string]*repoItem // keyed by repo name
+	listOrder []string             // repo names in list order (repos + result)
 	cursor    int
 	filter    string
 	filtering bool
@@ -67,6 +67,20 @@ type Model struct {
 
 	userNavigated bool // user moved cursor manually
 	ctrlC         bool // quit was triggered by Ctrl-C
+
+	// splitRatio is the left pane width as a fraction of total width.
+	splitRatio float64
+	// resultOverlay shows the Result summary in the preview without moving
+	// the cursor; cleared by any list navigation.
+	resultOverlay bool
+	// dragging tracks an in-progress divider drag.
+	dragging bool
+
+	// Geometry captured during the last View, used for mouse hit-testing.
+	geoLeftWidth  int
+	geoBodyTop    int
+	geoBodyHeight int
+	geoRowIndex   []int // visual body row -> visible index (-1 for separator)
 }
 
 type repoItem struct {
@@ -109,8 +123,15 @@ func New(cfg Config) *Model {
 		listOrder:         order,
 		previewAutoScroll: true,
 		startTime:         time.Now(),
+		splitRatio:        defaultSplit,
 	}
 }
+
+const (
+	defaultSplit = 0.4
+	minSplit     = 0.2
+	maxSplit     = 0.7
+)
 
 // Init starts background work.
 func (model *Model) Init() tea.Cmd {
@@ -193,9 +214,116 @@ func (model *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		return model.handleKey(message)
+
+	case tea.MouseMsg:
+		return model.handleMouse(message)
 	}
 
 	return model, nil
+}
+
+func (model *Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	onLeftPane := msg.X <= model.geoLeftWidth+2
+
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		if onLeftPane {
+			model.userNavigated = true
+			model.resultOverlay = false
+			if model.cursor > 0 {
+				model.cursor--
+			}
+			model.previewAutoScroll = true
+			model.previewScroll = 0
+		} else {
+			model.previewAutoScroll = false
+			model.previewScroll -= 3
+			if model.previewScroll < 0 {
+				model.previewScroll = 0
+			}
+		}
+		return model, nil
+	case tea.MouseButtonWheelDown:
+		if onLeftPane {
+			model.userNavigated = true
+			model.resultOverlay = false
+			if model.cursor < len(model.visibleList())-1 {
+				model.cursor++
+			}
+			model.previewAutoScroll = true
+			model.previewScroll = 0
+		} else {
+			model.previewAutoScroll = false
+			model.previewScroll += 3
+		}
+		return model, nil
+	}
+
+	dividerCol := model.geoLeftWidth + 3
+	switch msg.Action {
+	case tea.MouseActionPress:
+		if msg.Button == tea.MouseButtonLeft {
+			if abs(msg.X-dividerCol) <= 1 {
+				model.dragging = true
+			} else if idx, ok := model.listIndexAt(msg.X, msg.Y); ok {
+				model.cursor = idx
+				model.userNavigated = true
+				model.resultOverlay = false
+				model.previewAutoScroll = true
+				model.previewScroll = 0
+			}
+		}
+	case tea.MouseActionMotion:
+		if model.dragging {
+			model.setSplitFromX(msg.X)
+		}
+	case tea.MouseActionRelease:
+		model.dragging = false
+	}
+	return model, nil
+}
+
+// listIndexAt maps mouse coordinates to a visible list index using the row map
+// captured during the last render. Returns false for the separator / outside.
+func (model *Model) listIndexAt(x, y int) (int, bool) {
+	if x < 1 || x > model.geoLeftWidth+2 {
+		return 0, false
+	}
+	bodyRow := y - model.geoBodyTop
+	if bodyRow < 0 || bodyRow >= len(model.geoRowIndex) {
+		return 0, false
+	}
+	idx := model.geoRowIndex[bodyRow]
+	if idx < 0 {
+		return 0, false
+	}
+	return idx, true
+}
+
+// setSplitFromX sets the split ratio from an absolute divider column.
+func (model *Model) setSplitFromX(x int) {
+	if model.width == 0 {
+		return
+	}
+	ratio := float64(x-3) / float64(model.width)
+	model.splitRatio = clampSplit(ratio)
+}
+
+func clampSplit(ratio float64) float64 {
+	if ratio < minSplit {
+		return minSplit
+	}
+	if ratio > maxSplit {
+		return maxSplit
+	}
+	return ratio
+}
+
+func abs(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -220,7 +348,7 @@ func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch msg.String() {
-	case "q", "esc":
+	case "q":
 		model.cfg.Cancel()
 		return model, tea.Quit
 
@@ -231,6 +359,7 @@ func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "j", "down":
 		model.userNavigated = true
+		model.resultOverlay = false
 		visible := model.visibleList()
 		if model.cursor < len(visible)-1 {
 			model.cursor++
@@ -240,6 +369,7 @@ func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "k", "up":
 		model.userNavigated = true
+		model.resultOverlay = false
 		if model.cursor > 0 {
 			model.cursor--
 		}
@@ -249,10 +379,22 @@ func (model *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "g":
 		model.cursor = 0
 		model.userNavigated = true
+		model.resultOverlay = false
 
 	case "G":
 		model.cursor = len(model.visibleList()) - 1
 		model.userNavigated = true
+		model.resultOverlay = false
+
+	case " ":
+		// Toggle the Result summary overlay without moving the cursor.
+		model.resultOverlay = !model.resultOverlay
+
+	case "[":
+		model.splitRatio = clampSplit(model.splitRatio - 0.03)
+
+	case "]":
+		model.splitRatio = clampSplit(model.splitRatio + 0.03)
 
 	case "tab":
 		model.previewFocused = !model.previewFocused
@@ -334,8 +476,11 @@ func (model *Model) View() string {
 	}
 
 	totalHeight := model.height
-	statusBarHeight := 1
-	bodyHeight := totalHeight - statusBarHeight - 2 // borders
+	statusBarHeight := 2
+	// Total rows emitted = top + header + divider + bodyHeight + footer divider
+	// + statusBarHeight + bottom. Keep that == totalHeight so the frame fits the
+	// alt-screen exactly (an over-tall View renders blank in some terminals).
+	bodyHeight := totalHeight - statusBarHeight - 5
 
 	leftWidth := model.leftPaneWidth()
 	rightWidth := model.width - leftWidth - 3 // borders
@@ -344,9 +489,15 @@ func (model *Model) View() string {
 		rightWidth = 10
 	}
 
+	// Capture geometry for mouse hit-testing (body starts after top + header
+	// + divider = 3 rows).
+	model.geoLeftWidth = leftWidth
+	model.geoBodyTop = 3
+	model.geoBodyHeight = bodyHeight
+
 	leftPane := model.renderLeftPane(leftWidth, bodyHeight)
 	rightPane := model.renderRightPane(rightWidth, bodyHeight)
-	statusBar := model.renderStatusBar()
+	statusRow1, statusRow2 := model.renderStatusBar()
 
 	// Build layout with borders.
 	top := "┌" + strings.Repeat("─", leftWidth+2) + "┬" + strings.Repeat("─", rightWidth+2) + "┐"
@@ -386,31 +537,30 @@ func (model *Model) View() string {
 		sb.WriteString("│" + padRight(left, leftWidth+2) + "│" + padRight(right, rightWidth+2) + "│\n")
 	}
 
-	// Footer with status bar spanning full width.
+	// Footer with the two-row status bar spanning full width.
 	sb.WriteString("├" + strings.Repeat("─", model.width-2) + "┤\n")
-	sb.WriteString("│" + padRight(" "+statusBar, model.width-2) + "│\n")
+	sb.WriteString("│" + padRight(" "+statusRow1, model.width-2) + "│\n")
+	sb.WriteString("│" + padRight(" "+statusRow2, model.width-2) + "│\n")
 	sb.WriteString(bottom)
 
 	return sb.String()
 }
 
 func (model *Model) leftPaneWidth() int {
-	maxName := 26
-	for _, name := range model.listOrder {
-		if len(name) > maxName && name != resultItemName {
-			maxName = len(name)
-		}
+	if model.width == 0 {
+		return 28
 	}
-	minWidth := maxName + 2
-	if minWidth < 28 {
-		minWidth = 28
+	width := int(float64(model.width) * model.splitRatio)
+	// Keep enough room for names on the left and the preview on the right.
+	minWidth := 20
+	maxWidth := model.width - 14
+	if width < minWidth {
+		width = minWidth
 	}
-	// Don't let left pane exceed 45% of total width.
-	maxAllowed := model.width * 45 / 100
-	if minWidth > maxAllowed {
-		minWidth = maxAllowed
+	if maxWidth >= minWidth && width > maxWidth {
+		width = maxWidth
 	}
-	return minWidth
+	return width
 }
 
 func (model *Model) renderLeftHeader(width int) string {
@@ -421,12 +571,24 @@ func (model *Model) renderLeftHeader(width int) string {
 	return padRight(title, width)
 }
 
-func (model *Model) renderRightHeader(width int) string {
+// previewName returns the list item shown in the preview, honoring the Result
+// overlay. The bool is false when nothing is selectable.
+func (model *Model) previewName() (string, bool) {
+	if model.resultOverlay {
+		return resultItemName, true
+	}
 	visible := model.visibleList()
 	if model.cursor >= len(visible) || len(visible) == 0 {
+		return "", false
+	}
+	return visible[model.cursor], true
+}
+
+func (model *Model) renderRightHeader(width int) string {
+	name, ok := model.previewName()
+	if !ok {
 		return ""
 	}
-	name := visible[model.cursor]
 	item := model.results[name]
 	if item == nil {
 		return name
@@ -472,6 +634,7 @@ func (model *Model) renderLeftPane(width, height int) string {
 	}
 
 	var lines []string
+	rowMap := make([]int, 0, height) // visual row -> visible index (-1 separator)
 	for idx := startIdx; idx < len(visible) && len(lines) < height; idx++ {
 		name := visible[idx]
 		item := model.results[name]
@@ -487,6 +650,7 @@ func (model *Model) renderLeftPane(width, height int) string {
 			// Separator + result item.
 			if len(lines) > 0 && idx > 0 {
 				lines = append(lines, " "+strings.Repeat("─", width-2))
+				rowMap = append(rowMap, -1)
 			}
 			rowStr = " " + glyph + " " + name
 		} else {
@@ -499,18 +663,18 @@ func (model *Model) renderLeftPane(width, height int) string {
 			rowStr = styleSelected.Render(rowStr)
 		}
 		lines = append(lines, rowStr)
+		rowMap = append(rowMap, idx)
 	}
 
+	model.geoRowIndex = rowMap
 	return strings.Join(lines, "\n")
 }
 
 func (model *Model) renderRightPane(width, height int) string {
-	visible := model.visibleList()
-	if model.cursor >= len(visible) {
+	name, ok := model.previewName()
+	if !ok {
 		return ""
 	}
-
-	name := visible[model.cursor]
 	item := model.results[name]
 	if item == nil {
 		return ""
@@ -572,21 +736,30 @@ func (model *Model) renderRightPane(width, height int) string {
 	return " " + result
 }
 
-func (model *Model) renderStatusBar() string {
+func (model *Model) renderStatusBar() (string, string) {
 	running := model.countByStatus(parser.StatusRunning)
 	done := model.countDone()
 	total := len(model.repos)
 	elapsed := model.elapsed.Truncate(100 * time.Millisecond)
 
-	filterStr := ""
+	// Row 1 — move & view, or the live filter prompt when filtering.
+	var row1 string
 	if model.filtering {
-		filterStr = fmt.Sprintf(" · filter: %s_", model.filter)
-	} else if model.filter != "" {
-		filterStr = fmt.Sprintf(" · filter: %s", model.filter)
+		row1 = fmt.Sprintf("filter: %s_", model.filter)
+	} else {
+		filterTag := ""
+		if model.filter != "" {
+			filterTag = fmt.Sprintf("[%s] ", model.filter)
+		}
+		row1 = filterTag + "j/k ↑/↓ move · g/G top/end · click select · wheel scroll · space result"
 	}
 
-	return fmt.Sprintf("j/k nav · r retry · R retry-failed · q quit · %d jobs · %d/%d done · %d running · %s%s",
-		model.cfg.Jobs, done, total, running, elapsed, filterStr)
+	// Row 2 — act & layout, plus live run stats.
+	row2 := fmt.Sprintf(
+		"r/R retry · / filter · [ ] / drag resize · tab focus · q quit  ·  %d jobs · %d/%d done · %d running · %s",
+		model.cfg.Jobs, done, total, running, elapsed)
+
+	return row1, row2
 }
 
 func (model *Model) countByStatus(status parser.Status) int {

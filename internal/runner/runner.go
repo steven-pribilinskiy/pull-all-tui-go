@@ -118,7 +118,7 @@ type AllDoneMsg struct{}
 // Config holds runner configuration.
 type Config struct {
 	Jobs    int
-	Timeout int // seconds
+	Timeout int               // seconds
 	Send    func(interface{}) // callback to send messages
 }
 
@@ -194,14 +194,15 @@ func (runner *Runner) Start(ctx context.Context, repos []discovery.Repo) {
 	}
 	runner.mu.Unlock()
 
+	// Collect dirty repos to notify asynchronously. Sending synchronously here
+	// would deadlock: Start runs inside the TUI model's Init(), which bubbletea
+	// calls before its event loop drains the (unbuffered) message channel — a
+	// blocking Send would hang before the first frame renders (blank screen).
+	var dirty []discovery.Repo
 	var waitGroup sync.WaitGroup
 	for _, repo := range repos {
 		if repo.Dirty {
-			// Already classified as skipped; emit status immediately.
-			runner.cfg.Send(StatusMsg{
-				RepoName: repo.Name,
-				Status:   parser.StatusSkipped,
-			})
+			dirty = append(dirty, repo)
 			continue
 		}
 		waitGroup.Add(1)
@@ -213,6 +214,14 @@ func (runner *Runner) Start(ctx context.Context, repos []discovery.Repo) {
 			defer runner.sem.Release(1)
 			runner.runPull(ctx, repo)
 		}(repo)
+	}
+
+	if len(dirty) > 0 {
+		go func() {
+			for _, repo := range dirty {
+				runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusSkipped})
+			}
+		}()
 	}
 
 	go func() {

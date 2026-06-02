@@ -171,6 +171,7 @@ func run() int {
 
 	prog := tea.NewProgram(tuiModel,
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 	progPtr.Store(prog)
 
