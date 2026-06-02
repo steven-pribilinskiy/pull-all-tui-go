@@ -18,6 +18,7 @@ import (
 
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/discovery"
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/parser"
+	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/profile"
 )
 
 // Config holds configuration for no-TTY mode.
@@ -26,13 +27,16 @@ type Config struct {
 	Jobs        int
 	Timeout     int
 	NoWorktrees bool
+	Profile     bool
+	ProfileOut  string
 }
 
 // repoResult holds completed per-repo state for sequential output.
 type repoResult struct {
-	status parser.Status
-	lines  []string // stdout+stderr lines from git pull
-	diff   []string // git diff --stat output (updated repos only)
+	status  parser.Status
+	lines   []string // stdout+stderr lines from git pull
+	diff    []string // git diff --stat output (updated repos only)
+	elapsed time.Duration
 }
 
 // Run executes all pulls and streams output matching the bash reference.
@@ -217,13 +221,55 @@ func Run(cfg Config) int {
 		}
 	}
 
+	if cfg.Profile {
+		emitProfile(cfg, repos, results)
+	}
+
 	if len(failed) > 0 {
 		return 1
 	}
 	return 0
 }
 
-func runPull(ctx context.Context, timeout int, repo discovery.Repo) *repoResult {
+// emitProfile writes the per-repo timing report to ProfileOut or stderr.
+func emitProfile(cfg Config, repos []discovery.Repo, results map[string]*repoResult) {
+	rows := make([]profile.Row, 0, len(repos))
+	for _, repo := range repos {
+		result := results[repo.Name]
+		if result == nil {
+			continue
+		}
+		rows = append(rows, profile.Row{
+			Name:    repo.Name,
+			Branch:  repo.Branch,
+			Status:  result.status,
+			Elapsed: result.elapsed,
+			LastLog: profile.LastLogLine(result.status, result.lines),
+		})
+	}
+
+	out := os.Stderr
+	if cfg.ProfileOut != "" {
+		file, err := os.Create(cfg.ProfileOut)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error writing profile: %v\n", err)
+			profile.Write(os.Stderr, rows)
+			return
+		}
+		defer file.Close()
+		profile.Write(file, rows)
+		return
+	}
+	profile.Write(out, rows)
+}
+
+func runPull(ctx context.Context, timeout int, repo discovery.Repo) (result *repoResult) {
+	started := time.Now()
+	defer func() {
+		if result != nil {
+			result.elapsed = time.Since(started)
+		}
+	}()
 	if timeout <= 0 {
 		timeout = 30
 	}
@@ -275,7 +321,7 @@ func runPull(ctx context.Context, timeout int, repo discovery.Repo) *repoResult 
 	}
 
 	status := parser.ClassifyOutput(exitCode, capturedLines)
-	result := &repoResult{status: status, lines: capturedLines}
+	result = &repoResult{status: status, lines: capturedLines}
 
 	// Append diff stat for updated repos.
 	if status == parser.StatusUpdated {

@@ -23,6 +23,7 @@ import (
 
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/discovery"
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/notty"
+	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/profile"
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/runner"
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/tui"
 )
@@ -40,6 +41,8 @@ func run() int {
 		flagNoWorktrees bool
 		flagTimeout     int
 		flagVersion     bool
+		flagProfile     bool
+		flagProfileOut  string
 	)
 
 	flag.IntVar(&flagJobs, "jobs", 0, "concurrency (default: nproc)")
@@ -48,6 +51,8 @@ func run() int {
 	flag.BoolVar(&flagNoWorktrees, "no-worktrees", false, "skip worktree discovery")
 	flag.IntVar(&flagTimeout, "timeout", 0, "per-pull timeout in seconds (default: 30)")
 	flag.BoolVar(&flagVersion, "version", false, "print version and exit")
+	flag.BoolVar(&flagProfile, "profile", false, "emit a per-repo timing report (slowest first)")
+	flag.StringVar(&flagProfileOut, "profile-out", "", "write the profile report to FILE instead of stderr")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: pull-all-tui [DIR]\n\n")
 		flag.PrintDefaults()
@@ -97,6 +102,9 @@ func run() int {
 		timeout = 30
 	}
 
+	// Profile: flag → env (PULL_PROFILE, any non-empty value enables).
+	profileOn := profile.Enabled(flagProfile, os.Getenv("PULL_PROFILE"))
+
 	// Determine if we're in a TTY.
 	noTUI := flagNoTUI
 	if !noTUI {
@@ -111,6 +119,8 @@ func run() int {
 			Jobs:        jobs,
 			Timeout:     timeout,
 			NoWorktrees: flagNoWorktrees,
+			Profile:     profileOn,
+			ProfileOut:  flagProfileOut,
 		})
 	}
 
@@ -156,6 +166,7 @@ func run() int {
 		Runner:      repoRunner,
 		Ctx:         ctx,
 		Cancel:      cancel,
+		Profile:     profileOn,
 	})
 
 	prog := tea.NewProgram(tuiModel,
@@ -168,6 +179,24 @@ func run() int {
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
 		return 1
+	}
+
+	// Emit the profile report after the alt-screen is torn down so it doesn't
+	// corrupt the display.
+	if profileOn {
+		rows := repoRunner.ProfileRows()
+		out := os.Stderr
+		if flagProfileOut != "" {
+			if file, err := os.Create(flagProfileOut); err == nil {
+				defer file.Close()
+				profile.Write(file, rows)
+			} else {
+				fmt.Fprintf(os.Stderr, "error writing profile: %v\n", err)
+				profile.Write(out, rows)
+			}
+		} else {
+			profile.Write(out, rows)
+		}
 	}
 
 	if finalTUI, ok := finalModel.(*tui.Model); ok {

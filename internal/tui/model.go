@@ -36,6 +36,7 @@ type Config struct {
 	Runner      *runner.Runner
 	Ctx         context.Context
 	Cancel      context.CancelFunc
+	Profile     bool
 }
 
 // Model is the bubbletea model.
@@ -435,6 +436,13 @@ func (model *Model) renderRightHeader(width int) string {
 		pidStr = fmt.Sprintf("%d", item.pid)
 	}
 	header := fmt.Sprintf("%s · %s · pid %s", name, item.status.String(), pidStr)
+	if model.cfg.Profile && name != resultItemName {
+		if result := model.cfg.Runner.GetResult(name); result != nil {
+			if elapsed := result.LiveElapsed(); elapsed > 0 {
+				header += fmt.Sprintf(" · %.2fs", elapsed.Seconds())
+			}
+		}
+	}
 	return padRight(header, width)
 }
 

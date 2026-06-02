@@ -15,6 +15,7 @@ import (
 
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/discovery"
 	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/parser"
+	"github.com/steven-pribilinskiy/pull-all-tui-go/internal/profile"
 )
 
 const ringBufferCap = 10_000
@@ -28,6 +29,8 @@ type RepoResult struct {
 	Lines   []string // ring buffer
 	lineIdx int      // next write position
 	count   int      // total lines written
+	Started time.Time
+	Elapsed time.Duration
 }
 
 // AppendLine adds a line to the ring buffer.
@@ -57,6 +60,20 @@ func (result *RepoResult) GetLines() []string {
 	copy(out, result.Lines[start:])
 	copy(out[ringBufferCap-start:], result.Lines[:start])
 	return out
+}
+
+// LiveElapsed returns the final elapsed if set, else elapsed since start for a
+// running pull, else 0.
+func (result *RepoResult) LiveElapsed() time.Duration {
+	result.mu.Lock()
+	defer result.mu.Unlock()
+	if result.Elapsed > 0 {
+		return result.Elapsed
+	}
+	if !result.Started.IsZero() {
+		return time.Since(result.Started)
+	}
+	return 0
 }
 
 // SetStatus updates the status under the lock.
@@ -127,6 +144,28 @@ func (runner *Runner) GetResult(name string) *RepoResult {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	return runner.results[name]
+}
+
+// ProfileRows builds per-repo timing rows for the profile report.
+func (runner *Runner) ProfileRows() []profile.Row {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	rows := make([]profile.Row, 0, len(runner.results))
+	for _, result := range runner.results {
+		result.mu.Lock()
+		status := result.Status
+		lines := make([]string, len(result.Lines))
+		copy(lines, result.Lines)
+		rows = append(rows, profile.Row{
+			Name:    result.Repo.Name,
+			Branch:  result.Repo.Branch,
+			Status:  status,
+			Elapsed: result.Elapsed,
+			LastLog: profile.LastLogLine(status, lines),
+		})
+		result.mu.Unlock()
+	}
+	return rows
 }
 
 // GetAllResults returns all results in alphabetical order.
@@ -205,6 +244,16 @@ func (runner *Runner) runPull(ctx context.Context, repo discovery.Repo) {
 	runner.mu.Lock()
 	result := runner.results[repo.Name]
 	runner.mu.Unlock()
+
+	started := time.Now()
+	result.mu.Lock()
+	result.Started = started
+	result.mu.Unlock()
+	defer func() {
+		result.mu.Lock()
+		result.Elapsed = time.Since(started)
+		result.mu.Unlock()
+	}()
 
 	result.SetStatus(parser.StatusRunning)
 	runner.cfg.Send(StatusMsg{RepoName: repo.Name, Status: parser.StatusRunning})
